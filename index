@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Calculateur Thermistance CVC</title>
+    <style>
+        :root {
+            --primary-color: #0056b3;
+            --bg-color: #f8f9fa;
+            --card-bg: #ffffff;
+            --border-radius: 8px;
+        }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: var(--bg-color);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            margin: 0;
+        }
+        .container {
+            background-color: var(--card-bg);
+            padding: 2rem;
+            border-radius: var(--border-radius);
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 500px;
+        }
+        h2 { text-align: center; color: #333; margin-bottom: 1.5rem; }
+        
+        .form-group { margin-bottom: 1rem; }
+        label { display: block; margin-bottom: 0.5rem; font-weight: 600; color: #555; }
+        
+        select, input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            box-sizing: border-box; /* Important pour le padding */
+        }
+        
+        .mode-switch {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1rem;
+            justify-content: center;
+        }
+        .mode-label { font-weight: normal; cursor: pointer; }
+
+        .result-box {
+            background-color: #e9ecef;
+            padding: 1rem;
+            border-radius: 4px;
+            margin-top: 1.5rem;
+            border-left: 5px solid var(--primary-color);
+        }
+        .result-item {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 0.5rem;
+        }
+        .result-item:last-child { margin-bottom: 0; }
+        .label-res { color: #666; }
+        .val-res { font-weight: bold; color: #000; }
+        .tol-res { font-size: 0.85em; color: #666; }
+
+        .error { color: #dc3545; text-align: center; margin-top: 1rem; display: none;}
+    </style>
+</head>
+<body>
+
+<div class="container">
+    <h2>Convertisseur Thermistance</h2>
+
+    <div class="mode-switch">
+        <label class="mode-label">
+            <input type="radio" name="calcMode" value="TtoR" checked onchange="updateUI()"> 
+            Température → Résistance
+        </label>
+        <label class="mode-label">
+            <input type="radio" name="calcMode" value="RtoT" onchange="updateUI()"> 
+            Résistance → Température
+        </label>
+    </div>
+
+    <div class="form-group">
+        <label for="sensorType">Type de Sonde</label>
+        <select id="sensorType" onchange="calculate()">
+            </select>
+    </div>
+
+    <div class="form-group">
+        <label id="inputLabel" for="inputValue">Température (°C)</label>
+        <input type="number" id="inputValue" step="0.1" placeholder="Entrez la valeur" oninput="calculate()">
+    </div>
+
+    <div id="resultBox" class="result-box" style="display:none;">
+        <div class="result-item">
+            <span class="label-res">Nominale :</span>
+            <span class="val-res" id="resNominal">--</span>
+        </div>
+        <div class="result-item">
+            <span class="label-res">Minimum (-tol) :</span>
+            <span class="val-res" id="resMin">--</span>
+        </div>
+        <div class="result-item">
+            <span class="label-res">Maximum (+tol) :</span>
+            <span class="val-res" id="resMax">--</span>
+        </div>
+    </div>
+
+    <div id="errorMsg" class="error"></div>
+</div>
+
+<script>
+    /* =========================================
+       1. CONFIGURATION - MODIFIABLE
+       ========================================= */
+    // Ajoutez ou modifiez les sondes ici.
+    // R_ref : Résistance de référence en Ohms (pas kOhms pour le calcul interne)
+    // T_ref_C : Température de référence en °C
+    // B : Coefficient Bêta
+    // tol_R_percent : Tolérance sur R0 (%)
+    // tol_B_percent : Tolérance sur B (%)
+    
+    const SENSORS = {
+        low: {
+            name: "Low Temp (Outdoor/Pipe) - R15k@0°C",
+            R_ref: 15000, 
+            T_ref_C: 0, 
+            B: 3480,
+            tol_R_percent: 3,
+            tol_B_percent: 2
+        },
+        medium: {
+            name: "Medium Temp (Heatsink) - R17k@50°C",
+            R_ref: 17000, 
+            T_ref_C: 50, 
+            B: 4150,
+            tol_R_percent: 2, // Basé sur l'image
+            tol_B_percent: 3
+        },
+        high: {
+            name: "High Temp (Discharge) - R7.465k@120°C",
+            R_ref: 7465, 
+            T_ref_C: 120, 
+            B: 4057,
+            tol_R_percent: 2,
+            tol_B_percent: 2
+        }
+    };
+
+    /* =========================================
+       2. MOTEUR DE CALCUL
+       ========================================= */
+    const KELVIN = 273.15;
+
+    function formatOhms(ohms) {
+        if (ohms >= 1000) return (ohms / 1000).toFixed(3) + " kΩ";
+        return ohms.toFixed(1) + " Ω";
+    }
+
+    function getResistance(T_c, sensor, mode) {
+        // mode = 'nom', 'min', 'max'
+        // Logique de pire cas pour les tolérances
+        const T_k = T_c + KELVIN;
+        const T_ref_k = sensor.T_ref_C + KELVIN;
+        
+        let R_ref_calc = sensor.R_ref;
+        let B_calc = sensor.B;
+
+        // Facteurs de tolérance
+        const factorR = sensor.tol_R_percent / 100;
+        const factorB = sensor.tol_B_percent / 100;
+
+        if (mode === 'nom') {
+            // Calcul standard
+        } else {
+            // Analyse du pire cas : le signe de l'exposant change selon si T > T_ref ou T < T_ref
+            const deltaT = (1/T_k) - (1/T_ref_k); // Positif si T < T_ref, Négatif si T > T_ref
+            
+            // Si on veut MAX Resistance :
+            // On prend R_ref MAX.
+            // Pour B : Si deltaT > 0, on veut exp grand -> B grand. Si deltaT < 0, on veut exp moins négatif (proche de 0) -> B petit.
+            
+            if (mode === 'max') {
+                R_ref_calc = sensor.R_ref * (1 + factorR);
+                if (deltaT >= 0) B_calc = sensor.B * (1 + factorB);
+                else             B_calc = sensor.B * (1 - factorB);
+            }
+            // Si on veut MIN Resistance :
+            // On prend R_ref MIN.
+            // Pour B : Inverse du Max.
+            else if (mode === 'min') {
+                R_ref_calc = sensor.R_ref * (1 - factorR);
+                if (deltaT >= 0) B_calc = sensor.B * (1 - factorB);
+                else             B_calc = sensor.B * (1 + factorB);
+            }
+        }
+
+        const exponent = B_calc * ((1 / T_k) - (1 / T_ref_k));
+        return R_ref_calc * Math.exp(exponent);
+    }
+
+    function getTemperature(R, sensor, mode) {
+        // Inverse de la formule
+        // R = R_ref * exp(B * (1/T - 1/Tref))
+        // ln(R/R_ref) = B * (1/T - 1/Tref)
+        // 1/T = ln(R/R_ref)/B + 1/Tref
+        
+        // Pour les tolérances en mode inverse (Input R -> Output T) :
+        // Si on cherche T_max pour une résistance lue R :
+        // Cela correspond à la courbe de résistance qui donne la température la plus haute pour cette valeur Ohmique.
+        // Généralement : Résistance plus haute = Température plus basse.
+        // Donc si je lis 10kOhm.
+        // Courbe "Min Resistance" (capteur qui lit bas) dira qu'il fait très froid (pour avoir 10k).
+        // Courbe "Max Resistance" (capteur qui lit haut) dira qu'il fait moins froid.
+        
+        // Simplification rigoureuse : On utilise les fonctions getResistance pour itérer ou on inverse les paramètres.
+        // Pour afficher la plage de T possible pour une lecture R précise :
+        // T_min correspond à la courbe qui a la Résistance la plus FAIBLE pour une T donnée (donc il faut chauffer plus pour atteindre R).
+        // T_max correspond à la courbe qui a la Résistance la plus FORTE.
+        
+        // Utilisons les paramètres R_ref et B modifiés comme dans getResistance mais inversés logiquement.
+        
+        const T_ref_k = sensor.T_ref_C + KELVIN;
+        const factorR = sensor.tol_R_percent / 100;
+        const factorB = sensor.tol_B_percent / 100;
+        
+        let R_ref_calc = sensor.R_ref;
+        let B_calc = sensor.B;
+        
+        // Note: C'est complexe analytiquement car B affecte la pente. 
+        // Approximation robuste : Calculer T avec R_ref min/max et B min/max combinés (4 cas) et prendre le min/max du résultat.
+        
+        if (mode === 'nom') {
+            return calculateInv(R, sensor.R_ref, sensor.B, T_ref_k);
+        } else {
+            // On teste les 4 coins des tolérances pour trouver les extrêmes T
+            const r_opts = [sensor.R_ref * (1 - factorR), sensor.R_ref * (1 + factorR)];
+            const b_opts = [sensor.B * (1 - factorB), sensor.B * (1 + factorB)];
+            
+            let vals = [];
+            for (let r of r_opts) {
+                for (let b of b_opts) {
+                    vals.push(calculateInv(R, r, b, T_ref_k));
+                }
+            }
+            return (mode === 'min') ? Math.min(...vals) : Math.max(...vals);
+        }
+    }
+
+    function calculateInv(R, R_ref, B, T_ref_k) {
+        const val = (Math.log(R / R_ref) / B) + (1 / T_ref_k);
+        return (1 / val) - KELVIN;
+    }
+
+    /* =========================================
+       3. INTERFACE UTILISATEUR
+       ========================================= */
+    const sensorSelect = document.getElementById('sensorType');
+    
+    // Initialisation du menu déroulant
+    for (const [key, sensor] of Object.entries(SENSORS)) {
+        const option = document.createElement('option');
+        option.value = key;
+        option.textContent = sensor.name;
+        sensorSelect.appendChild(option);
+    }
+
+    function updateUI() {
+        const isTtoR = document.querySelector('input[name="calcMode"]:checked').value === 'TtoR';
+        const label = document.getElementById('inputLabel');
+        const input = document.getElementById('inputValue');
+        
+        if (isTtoR) {
+            label.textContent = "Température (°C)";
+            input.placeholder = "Ex: 25";
+        } else {
+            label.textContent = "Résistance (Ω)"; // Entrée en Ohms pour précision, ou on pourrait gérer kOhm
+            input.placeholder = "Ex: 15000";
+        }
+        calculate();
+    }
+
+    function calculate() {
+        const inputVal = parseFloat(document.getElementById('inputValue').value);
+        const sensorKey = document.getElementById('sensorType').value;
+        const sensor = SENSORS[sensorKey];
+        const isTtoR = document.querySelector('input[name="calcMode"]:checked').value === 'TtoR';
+        
+        const resBox = document.getElementById('resultBox');
+        const errBox = document.getElementById('errorMsg');
+        const elNom = document.getElementById('resNominal');
+        const elMin = document.getElementById('resMin');
+        const elMax = document.getElementById('resMax');
+
+        if (isNaN(inputVal)) {
+            resBox.style.display = 'none';
+            return;
+        }
+
+        resBox.style.display = 'block';
+        errBox.style.display = 'none';
+
+        if (isTtoR) {
+            // T -> R
+            const rNom = getResistance(inputVal, sensor, 'nom');
+            const rMin = getResistance(inputVal, sensor, 'min');
+            const rMax = getResistance(inputVal, sensor, 'max');
+
+            elNom.textContent = formatOhms(rNom);
+            elMin.textContent = formatOhms(rMin);
+            elMax.textContent = formatOhms(rMax);
+        } else {
+            // R -> T
+            // Attention: inputVal est supposé en Ohms. Si l'utilisateur entre 15 (pensant kOhms), c'est un piège classique.
+            // Pour la rigueur, on assume Ohms brut, mais on pourrait ajouter une détection.
+            // Ici on traite en Ohms purs.
+            
+            const tNom = getTemperature(inputVal, sensor, 'nom');
+            const tMin = getTemperature(inputVal, sensor, 'min');
+            const tMax = getTemperature(inputVal, sensor, 'max');
+
+            elNom.textContent = tNom.toFixed(2) + " °C";
+            // Inversion : Si R est fixe, la tolérance min/max donne une plage de T
+            elMin.textContent = tMin.toFixed(2) + " °C"; 
+            elMax.textContent = tMax.toFixed(2) + " °C";
+        }
+    }
+</script>
+
+</body>
+</html>
